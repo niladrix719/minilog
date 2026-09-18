@@ -22,7 +22,11 @@ func newStorage(t *testing.T, cfg *minilog.Config) *minilog.Storage {
 }
 
 // ingest adds a dataset to storage in batches and forces a flush.
-func ingest(t *testing.T, s *minilog.Storage, ds *gen.Dataset, batchSize int) {
+//
+// Takes the minilog.LogStorage interface rather than *minilog.Storage, so the
+// same helper drives a local engine and a cluster. *minilog.Storage satisfies
+// it, so every stage 1-4 call site is unchanged.
+func ingest(t *testing.T, s minilog.LogStorage, ds *gen.Dataset, batchSize int) {
 	t.Helper()
 	rows := ds.Rows
 	for len(rows) > 0 {

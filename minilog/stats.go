@@ -73,6 +73,31 @@ type SearchStats struct {
 	// BytesReadFromDisk is bytes pulled off disk during this query.
 	// Bump in: your file-read helper in part_reader.go.
 	BytesReadFromDisk int64
+
+	// --- cluster (stages 8-10) ------------------------------------------
+	//
+	// These are set by netselect.Storage.Search and are zero for a local
+	// query. A local storage never touches them, which is why Merge can sum
+	// them unconditionally.
+
+	// NodesQueried is the number of storage nodes the query was sent to.
+	// NodesFailed is how many of those did not return a usable answer.
+	//
+	// Set in: netselect.Storage.Search, ONCE, after the fan-out completes.
+	// Do not set them per-node -- a per-node SearchStats describes that
+	// node's local work and knows nothing about the cluster.
+	NodesQueried int
+	NodesFailed  int
+
+	// BytesReceivedFromNodes is the total response body size, in bytes, read
+	// back from storage nodes.
+	//
+	// This is the network-side twin of BytesReadFromDisk, and it is the
+	// number stage 10 moves: pushing Limit down to the nodes should collapse
+	// it without changing the answer.
+	//
+	// Bump in: netselect's per-node response reader.
+	BytesReceivedFromNodes int64
 }
 
 // Merge folds src into ss. Use it when searching partitions/shards in parallel.
@@ -90,6 +115,19 @@ func (ss *SearchStats) Merge(src *SearchStats) {
 	ss.RowsScanned += src.RowsScanned
 	ss.RowsMatched += src.RowsMatched
 	ss.BytesReadFromDisk += src.BytesReadFromDisk
+	ss.NodesQueried += src.NodesQueried
+	ss.NodesFailed += src.NodesFailed
+	ss.BytesReceivedFromNodes += src.BytesReceivedFromNodes
+}
+
+// IsPartial reports whether this result is missing data from at least one
+// storage node.
+//
+// A caller that ignores this is the failure mode stage 9 exists to prevent: a
+// partial answer that looks exactly like a complete one. Anything that
+// renders, alerts on, or compares a query result must consult it.
+func (ss *SearchStats) IsPartial() bool {
+	return ss.NodesFailed > 0
 }
 
 // BloomFalsePositives is the number of blocks a bloom filter waved through
@@ -119,7 +157,22 @@ func (ss *SearchStats) String() string {
 		ss.BloomMaybe, ss.BloomTruePositive, ss.BloomFalsePositives(),
 		ss.RowsScanned, ss.RowsMatched,
 		float64(ss.BytesReadFromDisk)/(1<<20),
-	)
+	) + ss.clusterSuffix()
+}
+
+// clusterSuffix renders the cluster counters, and only when there are any, so
+// that stage 1-4 log lines are unchanged.
+func (ss *SearchStats) clusterSuffix() string {
+	if ss.NodesQueried == 0 {
+		return ""
+	}
+	partial := ""
+	if ss.IsPartial() {
+		partial = " PARTIAL"
+	}
+	return fmt.Sprintf(", nodes %d/%d ok, net=%.1fMiB%s",
+		ss.NodesQueried-ss.NodesFailed, ss.NodesQueried,
+		float64(ss.BytesReceivedFromNodes)/(1<<20), partial)
 }
 
 // ---------------------------------------------------------------------------

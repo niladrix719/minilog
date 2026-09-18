@@ -219,6 +219,7 @@ func (s *Storage) Search(q *Query) ([]Row, *SearchStats) {
 	}
 
 	SortRows(rows)
+	rows = q.ApplyLimit(rows)
 	return rows, ss
 }
 

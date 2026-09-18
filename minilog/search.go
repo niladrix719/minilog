@@ -25,6 +25,32 @@ type Query struct {
 
 	// Filters are ANDed together. Empty means "match every row in range".
 	Filters []Filter
+
+	// --- cluster (stages 9-10) ------------------------------------------
+
+	// Limit caps the number of returned rows. 0 means unlimited.
+	//
+	// The rows returned are the FIRST Limit rows in (StreamID, Timestamp)
+	// order, not an arbitrary Limit of them. That definition is what makes
+	// the limit pushable to storage nodes in stage 10: each node's local
+	// first-Limit rows are guaranteed to contain that node's contribution to
+	// the global first-Limit, so merging N truncated streams and truncating
+	// again gives exactly the untruncated answer.
+	//
+	// Convince yourself of that before you implement the pushdown. A limit
+	// pushdown that returns the wrong rows is silent.
+	Limit int
+
+	// AllowPartialResponse lets a query succeed when some storage nodes are
+	// unreachable, instead of failing the whole query.
+	//
+	// Ignored by local storage -- there is nothing to be partial about.
+	//
+	// The contract when this is set: the result is still sorted and still
+	// contains no wrong rows, but it may be MISSING rows, and
+	// SearchStats.IsPartial() reports true. Never present a partial result as
+	// complete. See CLUSTER.md, stage 9.
+	AllowPartialResponse bool
 }
 
 // Filter matches rows where Column contains Token as a word token.
@@ -71,6 +97,19 @@ func (q *Query) MatchesRow(r *Row) bool {
 		}
 	}
 	return true
+}
+
+// ApplyLimit truncates rows to q.Limit, assuming they are already sorted.
+//
+// Used on both sides of the network in stage 10: the storage node applies it
+// to its local result, and the select node applies it again after merging.
+// Applying it twice must be identical to applying it once at the end -- that
+// is the whole correctness argument for the pushdown.
+func (q *Query) ApplyLimit(rows []Row) []Row {
+	if q.Limit <= 0 || len(rows) <= q.Limit {
+		return rows
+	}
+	return rows[:q.Limit]
 }
 
 // Columns returns the set of column names q reads.
