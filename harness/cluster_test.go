@@ -28,11 +28,13 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/niladrix719/minilog/agent"
 	"github.com/niladrix719/minilog/gen"
 	"github.com/niladrix719/minilog/internalapi"
 	"github.com/niladrix719/minilog/minilog"
@@ -79,6 +81,19 @@ type nodeServer struct {
 	h      http.Handler
 	faulty atomic.Bool
 
+	// Stage 11 fault modes. Both apply to InsertPath only, so flushes and
+	// queries keep working while inserts misbehave.
+	//
+	// reject400: the node answers every insert with 400. A client that
+	// retries this forever is stuck forever.
+	reject400 atomic.Bool
+
+	// storeThenFail: the node STORES the rows and then answers 503, as if the
+	// response were lost on the way back. The client cannot tell this from a
+	// node that never stored anything, so it retries -- and the rows are
+	// stored twice. This is the at-least-once case, made deterministic.
+	storeThenFail atomic.Bool
+
 	requests atomic.Int64
 }
 
@@ -87,6 +102,18 @@ func (n *nodeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if n.faulty.Load() {
 		http.Error(w, "injected fault: this node is up but broken", http.StatusInternalServerError)
 		return
+	}
+	if r.URL.Path == internalapi.InsertPath {
+		if n.reject400.Load() {
+			http.Error(w, "injected fault: this node rejects every insert", http.StatusBadRequest)
+			return
+		}
+		if n.storeThenFail.Load() {
+			rec := httptest.NewRecorder()
+			n.h.ServeHTTP(rec, r)
+			http.Error(w, "injected fault: stored, but the response was lost", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	n.h.ServeHTTP(w, r)
 }
@@ -140,6 +167,10 @@ func (ns *nodeSet) kill(i int)   { ns.listeners[i].open.Store(false) }
 func (ns *nodeSet) revive(i int) { ns.listeners[i].open.Store(true) }
 func (ns *nodeSet) fault(i int)  { ns.servers[i].faulty.Store(true) }
 func (ns *nodeSet) heal(i int)   { ns.servers[i].faulty.Store(false) }
+
+// Stage 11 insert-path fault modes. See nodeServer.
+func (ns *nodeSet) rejectInserts(i int, on bool) { ns.servers[i].reject400.Store(on) }
+func (ns *nodeSet) storeThenFail(i int, on bool) { ns.servers[i].storeThenFail.Store(on) }
 
 // flushAll flushes every node's local storage directly, bypassing HTTP.
 //
@@ -196,6 +227,26 @@ func (ns *nodeSet) insertClient(cfg netinsert.Config) *netinsert.Storage {
 	s := netinsert.NewStorage(&cfg)
 	ns.t.Cleanup(s.MustClose)
 	return s
+}
+
+// agentFor returns an agent forwarding to the given node indexes, with its
+// queues under dataPath. Pass the same dataPath twice to test restart.
+//
+// Backoff is set low so an outage test measures the agent, not the timer.
+// The caller closes it; a restart test must close the first one before
+// opening the second on the same dir.
+func (ns *nodeSet) agentFor(dataPath string, cfg agent.Config, nodes ...int) *agent.Agent {
+	for _, i := range nodes {
+		cfg.Addrs = append(cfg.Addrs, ns.addrs[i])
+	}
+	cfg.DataPath = dataPath
+	if cfg.RetryMinInterval == 0 {
+		cfg.RetryMinInterval = 20 * time.Millisecond
+	}
+	if cfg.RetryMaxInterval == 0 {
+		cfg.RetryMaxInterval = 200 * time.Millisecond
+	}
+	return agent.NewAgent(&cfg)
 }
 
 // cluster returns the full insert+select facade over this node set.

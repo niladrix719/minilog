@@ -378,13 +378,80 @@ lesson).
 
 ---
 
+### Stage 11 -- the agent
+
+Stage 7 wrote this down and then left it alone:
+
+```
+cluster: MustAddRows returns  ->  rows are in a client-side buffer, and
+                                  will not survive process death at all
+```
+
+That window is why `vlagent` exists. It sits next to the application, not
+inside the cluster, and it puts rows on disk before it promises anything:
+
+```
+app  ->  agent  ->  storage node(s)
+              |
+         queue on disk, one per destination
+```
+
+Package `agent/`, two files:
+
+- `queue.go` -- a durable FIFO of byte blocks: chunk files with fixed-width
+  length-prefixed blocks, a metainfo file for reader/writer offsets, recovery
+  on reopen (including a torn trailing write), a disk bound with oldest-drop.
+  Peek/ack rather than read, so at-least-once is a contract and not an
+  accident. This is `lib/persistentqueue` with the fast path removed.
+- `agent.go` -- `Agent.MustAddRows` batches into a block, `MustFlush` appends
+  the block to *every* destination's queue, and one sender per destination
+  does peek, send, ack -- retrying forever with backoff on no-response and
+  5xx, dropping on 4xx. This is `app/vlagent/remotewrite`.
+
+The agent speaks the internal insert protocol from stage 6. Nothing new
+crosses the wire; what is new is what happens before it does.
+
+**Decisions the stubs ask you to make and write down:**
+
+- fsync per block, or periodic. Measure both.
+- Full queue: drop oldest, or block the producer. The real one drops oldest,
+  and the reason is that the newest logs are the ones about the outage.
+- A 4xx at the head of the queue: retry it and stall everything behind it, or
+  drop it and log why. There is only one answer, but see how the queue changed
+  a stage 9 rule from "one failed request" to "the pipeline stops".
+
+**Measures:**
+
+- **Outage becomes latency.** Kill the destination mid-ingest. `MustAddRows`
+  keeps returning; revive; every row arrives. Report the accept latency with
+  the destination down and the drain time after.
+- **Restart becomes nothing.** Ingest with the destination down, close the
+  agent, reopen it on the same directory, revive. Every row arrives. Then
+  corrupt the tail of a chunk file first and do it again.
+- **A lost response becomes a duplicate.** The destination stores the block
+  and answers 503. The agent retries. Count the duplicate rows -- that is the
+  price of at-least-once in a store with no row identity, and VictoriaLogs
+  pays it on purpose.
+- **A dead replica costs the live one nothing.** Two destinations, one killed.
+  Report how long the live one took to drain.
+- **What a block costs.** Same rows at 100, 1k, 10k rows per block. The ratio
+  is the fsync, or it is not -- and either way you now know which.
+
+Note what this stage adds to the "out of scope" list below: replication is
+still out of scope *for the cluster*. The agent writing the same block to two
+clusters is how the real system gets HA without the cluster having to know
+the word, and it is fifteen lines once the queue exists.
+
+---
+
 ## Deliberately out of scope
 
 Same spirit as the README's list, and for the same reason -- each of these
 doubles the work and teaches nothing new about what is already here.
 
-- **Replication.** VictoriaLogs does not do it either. If you want the row
-  twice, run two clusters and write to both.
+- **Replication inside the cluster.** VictoriaLogs does not do it either. If
+  you want the row twice, run two clusters and write to both -- which is
+  exactly what the stage 11 agent does with two `Addrs`.
 - **Consensus, leader election, gossip, service discovery.** The node list is a
   flag. If you find yourself wanting Raft, re-read why fan-out-to-all made it
   unnecessary.
