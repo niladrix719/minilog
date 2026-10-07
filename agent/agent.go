@@ -15,8 +15,17 @@
 package agent
 
 import (
+	"bytes"
+	"cmp"
+	"fmt"
+	"io"
+	"net/http"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/niladrix719/minilog/internalapi"
 	"github.com/niladrix719/minilog/minilog"
 )
 
@@ -122,12 +131,22 @@ type DestStats struct {
 
 // Agent accepts rows and guarantees their delivery to every destination.
 //
-// You will need: a []*destination, the resolved config, the in-memory block
-// under construction (encoded bytes, a row count, a mutex, and the time it
-// was started), a stop channel, and a WaitGroup for the senders and the
-// flush ticker.
+// You will need: a []*destination, the resolved config, the block under
+// construction (a mutex, a []minilog.Row, and a running size estimate -- NOT
+// encoded bytes, see MustAddRows), a stop channel, and a WaitGroup for the
+// senders and the flush ticker.
 type Agent struct {
-	// TODO stage 11
+	dests []*destination
+
+	maxBlockSize  int
+	flushInterval time.Duration
+
+	mu      sync.Mutex
+	rows    []minilog.Row
+	rowSize int
+
+	stop chan struct{}
+	wg   sync.WaitGroup
 }
 
 // destination is one address: its queue, its sender, its counters.
@@ -139,7 +158,17 @@ type Agent struct {
 // *http.Client with its own Transport (stage 9 taught you why), and the
 // counters behind DestStats.
 type destination struct {
-	// TODO stage 11
+	addr   string
+	client *http.Client
+
+	mu     sync.Mutex
+	cond   *sync.Cond
+	q      *queue
+	closed bool
+
+	retryMin, retryMax time.Duration
+
+	blocksSent, bytesSent, retries, blockRejected atomic.Int64
 }
 
 // NewAgent opens (or creates) the queues under cfg.DataPath and starts one
@@ -148,10 +177,27 @@ type destination struct {
 // Opening must succeed with a backlog present: that is the restart case, and
 // the senders should start draining it before the first MustAddRows.
 func NewAgent(cfg *Config) *Agent {
-	panic("TODO stage 11: implement NewAgent")
+	destinations := make([]*destination, len(cfg.Addrs))
+	for i, addr := range cfg.Addrs {
+		d := &destination{
+			addr:     addr,
+			client:   &http.Client{Transport: &http.Transport{}},
+			q:        mustOpenQueue(filepath.Join(cfg.DataPath, addr), cfg.MaxPendingBytes),
+			retryMin: cmp.Or(cfg.RetryMinInterval, DefaultRetryMinInterval),
+			retryMax: cmp.Or(cfg.RetryMaxInterval, DefaultRetryMaxInterval),
+		}
+		d.cond = sync.NewCond(&d.mu)
+		destinations[i] = d
+	}
+	return &Agent{
+		dests:         destinations,
+		maxBlockSize:  cmp.Or(cfg.MaxBlockSize, DefaultMaxBlockSize),
+		flushInterval: cmp.Or(cfg.FlushInterval, DefaultFlushInterval),
+		stop:          make(chan struct{}),
+	}
 }
 
-// MustAddRows encodes rows into the in-memory block and returns.
+// MustAddRows appends rows to the in-memory block and returns.
 //
 // Returns when the rows are in MEMORY. They reach disk at the next flush --
 // MaxBlockSize or FlushInterval, whichever first -- or when MustFlush is
@@ -166,9 +212,13 @@ func NewAgent(cfg *Config) *Agent {
 // call -- one fsync per MustAddRows. Try it, measure the throughput, and then
 // decide. That measurement is stage 11's first number.
 //
-// Encode with internalapi.MarshalRowBatch, once, and append the encoded
-// bytes to EVERY destination's queue at flush time. Encoding once and
-// writing N times is the cheap kind of replication.
+// Buffer ROWS, not encoded bytes, and call internalapi.MarshalRowBatch once at
+// flush time. A batch is a row count followed by the rows, and the storage
+// node reads exactly one batch per request and discards anything after it, so
+// appending two encoded batches would silently drop the second. Track the size
+// the way netinsert does (len of MarshalRow per row). At flush, encode once and
+// write the same bytes to EVERY destination's queue: encoding once and writing
+// N times is the cheap kind of replication.
 func (a *Agent) MustAddRows(rows []minilog.Row) {
 	panic("TODO stage 11: implement Agent.MustAddRows")
 }
@@ -234,7 +284,25 @@ const (
 // non-2xx so the log line says WHY -- a rejected block with no reason in the
 // log is a block somebody deletes from the queue by hand at 3am.
 func (d *destination) sendBlock(block []byte) (sendResult, error) {
-	panic("TODO stage 11: implement destination.sendBlock")
+	var resp *http.Response
+	var b []byte
+	var err error
+	resp, err = d.client.Post(fmt.Sprintf("http://%s%s?version=%s", d.addr, internalapi.InsertPath, internalapi.ProtocolVersion),
+		"application/octet-stream",
+		bytes.NewReader(block))
+	if err != nil {
+		return sendUnavailable, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		return sendStored, nil
+	}
+	b, _ = io.ReadAll(resp.Body)
+	err = fmt.Errorf("%s: status: %d: %s", d.addr, resp.StatusCode, b)
+	if resp.StatusCode == 400 || resp.StatusCode == 404 {
+		return sendRejected, err
+	}
+	return sendServerError, err
 }
 
 // runSender is the loop: wait for a block, send it until it is stored or
@@ -276,5 +344,9 @@ func (d *destination) runSender(stopCh <-chan struct{}) {
 // all lose the same destination at the same second and all retry at exactly
 // Min, 2*Min, 4*Min. The real one does not jitter here; vmagent's does.
 func backoff(attempt int, minInterval, maxInterval time.Duration) time.Duration {
-	panic("TODO stage 11: implement backoff")
+	d := minInterval
+	for i := 0; i < attempt && d < maxInterval; i++ {
+		d *= 2
+	}
+	return min(d, maxInterval)
 }
